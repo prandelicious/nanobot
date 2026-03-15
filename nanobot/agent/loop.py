@@ -169,12 +169,108 @@ class AgentLoop:
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
         def _fmt(tc):
-            args = (tc.arguments[0] if isinstance(tc.arguments, list) else tc.arguments) or {}
+            args = tc.get("arguments") if isinstance(tc, dict) else tc.arguments
+            args = (args[0] if isinstance(args, list) else args) or {}
             val = next(iter(args.values()), None) if isinstance(args, dict) else None
+            name = tc.get("name", "tool") if isinstance(tc, dict) else tc.name
             if not isinstance(val, str):
-                return tc.name
-            return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
+                return name
+            return f'{name}("{val[:40]}…")' if len(val) > 40 else f'{name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
+
+    @staticmethod
+    def _collect_tool_calls(response: Any, iteration: int) -> list[dict[str, Any]]:
+        """Collect native tool calls plus TOOL_CALL: {...} patterns from content."""
+        calls: list[dict[str, Any]] = []
+
+        if response.has_tool_calls:
+            for tc in response.tool_calls:
+                calls.append({
+                    "id": tc.id,
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                    "origin": "native",
+                })
+
+        content = response.content or ""
+        decoder = json.JSONDecoder()
+        for idx, match in enumerate(re.finditer(r"TOOL_CALL:\s*", content)):
+            start = match.end()
+            try:
+                data, _ = decoder.raw_decode(content[start:])
+            except json.JSONDecodeError:
+                continue
+            name = data.get("name")
+            if not name:
+                continue
+            calls.append({
+                "id": data.get("id", f"pattern_{iteration}_{idx}"),
+                "name": name,
+                "arguments": data.get("arguments", {}),
+                "origin": "pattern",
+            })
+
+        return calls
+
+    @staticmethod
+    def _tool_call_placeholders(arguments: Any) -> list[str]:
+        """Extract placeholder ids like <call_1> from serialized arguments."""
+        try:
+            serialized = json.dumps(arguments, ensure_ascii=False)
+        except TypeError:
+            return []
+        return re.findall(r"<([a-zA-Z0-9_]+)>", serialized)
+
+    def _is_ready(self, arguments: dict[str, Any], results_map: dict[str, str], pending: list[dict[str, Any]]) -> bool:
+        """Return True when all placeholders referring to pending calls are resolved."""
+        pending_ids = {call["id"] for call in pending}
+        for placeholder in self._tool_call_placeholders(arguments):
+            if placeholder in pending_ids and placeholder not in results_map:
+                return False
+        return True
+
+    def _resolve_references(self, arguments: dict[str, Any], results_map: dict[str, str]) -> dict[str, Any]:
+        """Resolve <call_id> placeholders from prior tool results."""
+        try:
+            serialized = json.dumps(arguments, ensure_ascii=False)
+        except TypeError:
+            return arguments
+
+        for call_id, result in results_map.items():
+            placeholder = f"<{call_id}>"
+            if placeholder not in serialized:
+                continue
+            match = re.search(r"(?:ID|id):\s*([a-zA-Z0-9_\-.]+)", result)
+            replacement = match.group(1) if match else result.strip()
+            serialized = serialized.replace(placeholder, replacement)
+
+        remaining = re.findall(r"<([a-zA-Z0-9_]+)>", serialized)
+        if remaining:
+            for placeholder in remaining:
+                for result in results_map.values():
+                    match = re.search(r"(?:ID|id):\s*([a-zA-Z0-9_\-.]+)", result)
+                    if not match:
+                        continue
+                    serialized = serialized.replace(f"<{placeholder}>", match.group(1))
+                    break
+
+        try:
+            resolved = json.loads(serialized)
+        except json.JSONDecodeError:
+            return arguments
+        return resolved if isinstance(resolved, dict) else arguments
+
+    async def _execute_orchestrated_tool(
+        self,
+        call: dict[str, Any],
+        results_map: dict[str, str],
+    ) -> tuple[dict[str, Any], str]:
+        """Execute a single tool call after resolving references."""
+        resolved_arguments = self._resolve_references(call["arguments"], results_map)
+        args_str = json.dumps(resolved_arguments, ensure_ascii=False)
+        logger.info("Tool call ({}): {}({})", call["origin"], call["name"], args_str[:200])
+        result = await self.tools.execute(call["name"], resolved_arguments)
+        return call, result
 
     async def _run_agent_loop(
         self,
@@ -198,18 +294,27 @@ class AgentLoop:
                 model=self.model,
             )
 
-            if response.has_tool_calls:
+            all_tool_calls = self._collect_tool_calls(response, iteration)
+
+            if all_tool_calls:
                 if on_progress:
                     thought = self._strip_think(response.content)
                     if thought:
                         await on_progress(thought)
-                    tool_hint = self._tool_hint(response.tool_calls)
+                    tool_hint = self._tool_hint(all_tool_calls)
                     tool_hint = self._strip_think(tool_hint)
                     await on_progress(tool_hint, tool_hint=True)
 
                 tool_call_dicts = [
-                    tc.to_openai_tool_call()
-                    for tc in response.tool_calls
+                    {
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["name"],
+                            "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+                        },
+                    }
+                    for call in all_tool_calls
                 ]
                 messages = self.context.add_assistant_message(
                     messages, response.content, tool_call_dicts,
@@ -217,14 +322,38 @@ class AgentLoop:
                     thinking_blocks=response.thinking_blocks,
                 )
 
-                for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
+                pending = list(all_tool_calls)
+                results_map: dict[str, str] = {}
+                while pending:
+                    ready = [
+                        call for call in pending
+                        if self._is_ready(call["arguments"], results_map, pending)
+                    ]
+                    if not ready:
+                        logger.error(
+                            "Dependency deadlock in tool orchestration: {}",
+                            [call["id"] for call in pending],
+                        )
+                        for call in pending:
+                            result = "Error: Dependency resolution failed."
+                            results_map[call["id"]] = result
+                            tools_used.append(call["name"])
+                            messages = self.context.add_tool_result(
+                                messages, call["id"], call["name"], result,
+                            )
+                        break
+
+                    executed = await asyncio.gather(*[
+                        self._execute_orchestrated_tool(call, results_map)
+                        for call in ready
+                    ])
+                    for call, result in executed:
+                        results_map[call["id"]] = result
+                        tools_used.append(call["name"])
+                        messages = self.context.add_tool_result(
+                            messages, call["id"], call["name"], result,
+                        )
+                    pending = [call for call in pending if call not in ready]
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
