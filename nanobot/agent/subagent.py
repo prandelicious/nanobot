@@ -153,7 +153,23 @@ class SubagentManager:
                     break
 
             if final_result is None:
-                final_result = "Task completed but no final response was generated."
+                # Hit iteration limit - force a final response from the LLM
+                logger.warning("Subagent [{}] hit iteration limit, forcing final response", task_id)
+                # Add a message asking for the final result
+                messages.append({
+                    "role": "user",
+                    "content": "You've reached the maximum number of tool calls. Provide your final response now based on what you've learned. Be comprehensive and include all relevant findings."
+                })
+                try:
+                    response = await self.provider.chat_with_retry(
+                        messages=messages,
+                        tools=[],  # No tools - force text response
+                        model=self.model,
+                    )
+                    final_result = response.content or "Task completed but no final response was generated."
+                except Exception as e:
+                    logger.error("Subagent [{}] failed to get forced response: {}", task_id, e)
+                    final_result = "Task completed but no final response was generated."
 
             logger.info("Subagent [{}] completed successfully", task_id)
             await self._announce_result(task_id, label, task, final_result, origin, "ok")
@@ -207,6 +223,8 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
 You are a subagent spawned by the main agent to complete a specific task.
 Stay focused on the assigned task. Your final response will be reported back to the main agent.
+
+**IMPORTANT:** When you have completed your task, provide a comprehensive final response WITHOUT making any more tool calls. Your final response should summarize all your findings.
 
 ## Workspace
 {self.workspace}"""]
