@@ -208,3 +208,67 @@ class TestSubagentCancellation:
         assert len(assistant_messages) == 1
         assert assistant_messages[0]["reasoning_content"] == "hidden reasoning"
         assert assistant_messages[0]["thinking_blocks"] == [{"type": "thinking", "thinking": "step"}]
+
+    @pytest.mark.asyncio
+    async def test_wait_for_all_no_tasks(self):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=MagicMock(), bus=bus)
+        assert await mgr.wait_for_all() == 0
+
+    @pytest.mark.asyncio
+    async def test_wait_for_all_waits_for_tasks(self):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=MagicMock(), bus=bus)
+
+        completed = asyncio.Event()
+
+        async def slow_task():
+            await asyncio.sleep(0.1)
+            completed.set()
+
+        task = asyncio.create_task(slow_task())
+        await asyncio.sleep(0)
+        mgr._running_tasks["sub-1"] = task
+
+        assert mgr.get_running_count() == 1
+        count = await mgr.wait_for_all()
+        assert count == 1
+        assert completed.is_set()
+        # Note: cleanup callback only added when using spawn(), not manual task addition
+
+    @pytest.mark.asyncio
+    async def test_wait_for_all_timeout(self):
+        from nanobot.agent.subagent import SubagentManager
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        mgr = SubagentManager(provider=provider, workspace=MagicMock(), bus=bus)
+
+        async def slow_task():
+            await asyncio.sleep(10)
+
+        task = asyncio.create_task(slow_task())
+        await asyncio.sleep(0)
+        mgr._running_tasks["sub-1"] = task
+
+        count = await mgr.wait_for_all(timeout=0.1)
+        assert count == 1
+
+        # Cleanup
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass

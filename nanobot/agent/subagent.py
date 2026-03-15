@@ -230,3 +230,17 @@ Stay focused on the assigned task. Your final response will be reported back to 
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""
         return len(self._running_tasks)
+
+    async def wait_for_all(self, timeout: float | None = None) -> int:
+        """Wait for all running subagents to complete. Returns count waited for."""
+        tasks = [t for t in self._running_tasks.values() if not t.done()]
+        if not tasks:
+            return 0
+        try:
+            if timeout is not None:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+            else:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.TimeoutError:
+            logger.warning("Timeout waiting for {} subagents", len(tasks))
+        return len(tasks)

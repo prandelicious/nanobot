@@ -653,9 +653,24 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
+            # Run the agent loop in the background to consume inbound messages
+            # (needed for subagent results to be processed)
+            bus_task = asyncio.create_task(agent_loop.run())
+
             with _thinking_ctx():
                 response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
             _print_agent_response(response, render_markdown=markdown)
+
+            # Wait for any background subagents to complete before exiting
+            if agent_loop.subagents.get_running_count() > 0:
+                await agent_loop.subagents.wait_for_all()
+
+            agent_loop.stop()
+            bus_task.cancel()
+            try:
+                await bus_task
+            except asyncio.CancelledError:
+                pass
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
